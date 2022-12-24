@@ -19,6 +19,7 @@ from mimi_mani_msgs2.srv import ArmControl
 # M State,Angle,Deg/Step, 
 class MotorController(Node):
   def __init__(self):
+    super().__init__('motor_ctrl2')
     # Sub to get M state
     self.create_service(DynamixelStateList, 
                         '/dynamixel_workbench/dynamixel_state',
@@ -36,9 +37,10 @@ class MotorController(Node):
     self.m_client = self.create_client(DynamixelCommand,
                                            '/dynamixel_workbench/dynamixel_command')
     while not self.m_client.wait_for_service(1.0):
-      self.get_logger().warn('waiting for service... /dynamixel_workbench/dynamixel_command')
-    dxl_cmd_future = self.m_client.call_async(request)
-    rclpy.spin_until_future_complete(self, dxl_cmd_future)
+      self.get_logger().info('waiting for the service... /dynamixel_workbench/dynamixel_command')
+    self.dxl_req = DynamixelCommand.Request()
+    #dxl_cmd_future = self.m_client.call_async(request)
+    #rclpy.spin_until_future_complete(self, dxl_cmd_future)
     # M parameters
     self.origin_angle = self.declare_parameter('/mimi_specification/Origin_Angle')
     self.gear_ratio = self.declare_parameter('/mimi_specification/Gear_Ratio')
@@ -64,7 +66,7 @@ class MotorController(Node):
     latest_deg_list[2] *= -1
     latest_deg_list[5] *= -1
     pub_deg_list = Float64MultiArray(data=latest_deg_list)    
-    self.motor_angle_pub.publish(pub_deg_list)
+    self.m_pub.publish(pub_deg_list)
   
 # ---------------------
   def degToStep(self, deg):
@@ -84,31 +86,46 @@ class MotorController(Node):
     msg.Joint_names = joint_name # <- string[]
     #msg.points = [JointTrajectoryPoint() for i in range(1)]
     msg.points = [JointTrajectoryPoint()]
-    msg.points[0].positions = joint_angle  # target angle = float64[posi[ƒÆ]] <---
+    msg.points[0].positions = joint_angle  # target angle = float64[ posi[rad] ] <---
     msg.points[0].time_from_start = time.time(execute_time)  # !!!
     self.motor_pub.publish(msg) 
+  
+  def dxlCallAsync(self, cmd, id, name, value):# !!! want this to be able to do until future_comp
+    self.dxl_req.command = cmd
+    self.dxl_req.id = id
+    self.dxl_req.addr_name = name
+    self.dxl_req.value = value
+    return self.m_client.call_async(self.dxl_req)
   
   # set M posi(ether steps or deg value) and send dxl service client with them.
   def setPosition(self, m_id, position_value):
     if type(position_value) == type(float()):
       rotate_value = self.degToStep(position_value) # !!!
-    res = self.m_client('', m_id, 'Goal_Position', position_value)
+    #res = self.m_client('', m_id, 'Goal_Position', position_value)
+    dxl_future = self.dxlCallAsync('', m_id, 'Goal_Position', position_value) #The future object to wait on
+    rclpy.spin_until_future_complete(self, dxl_future)
+    result = dxl_future.result()
+    #return result # type: Bool
       
   # set a allowable current value to protect againist too big load
   def setCurrent(self, m_id, current_value):
-    res = self.motor_client('', m_id, 'Goal_Current', current_value)
+    #res = self.m_client('', m_id, 'Goal_Current', current_value)
+    dxl_future = self.dxlCallAsync('', m_id, 'Goal_Current', current_value)
+    rclpy.spin_until_future_complete(self, dxl_future)
+    result = dxl_future.result()
+    #return result # type: Bool
     
 # ctrl eath M 
 class JointController(MotorController):
   def __init__(self):
     super(JointController,self).__init__()
-    self.create_subscription('/servo/shoulder',Float64,self.controlShoulder)
-    self.create_subscription('/servo/elbow',Float64,self.controlElbow)
-    self.create_subscription('/servo/wrist',Float64,self.controlWrist)
-    self.create_subscription('/servo/endeffector',Bool,self.controlEndeffector)
-    self.create_subscription('/servo/head',Float64,self.controlHead) # Range: -30~40[deg]
+    self.create_subscription(Float64, '/servo/shoulder', self.controlShoulder)
+    self.create_subscription(Float64, '/servo/elbow', self.controlElbow)
+    self.create_subscription(Float64, '/servo/wrist', self.controlWrist)
+    self.create_subscription(Bool,    '/servo/endeffector', self.controlEndeffector)
+    self.create_subscription(Float64, '/servo/head', self.controlHead) # Range:-30~40[deg]
     
-  # convert ratate value of shoulder M. type of "deg" is able to be float or int or other
+  # Get M0 & M1 Radian. Convert shoulder ratate value. "deg"type: float, int, other
   def shoulderConversionProcess(self, deg):
     deg *= self.gear_ratio[0]
     rad = math.radians(deg) # deg to radian
@@ -200,9 +217,118 @@ class JointController(MotorController):
   
 class ManipulateArm(JointController):
   def __init__(self):
+    super(ManipulateArm, self).__init__()
+    self.create_service(StrTrg, '/servo/arm', self.changeArmPose)
+    # Service to comfirm mani ctrl using IK
+    self.create_service( ArmControl, '/servo/debug_arm', self.armControlService) #InverseKinetics
+    # SrvClient to get 3D coord
+    self.detect_depth = self.create_client(PositionEstimator, '/detect/depth')
+    while not self.detect_depth.wait_for_service(timeout_sec= 1.0):
+      self.get_logger().info('wait for the service... /detect/depth')
+    self.depth_req = PositionEstimator.Request()
+    #depth_future = self.detect_depth.call_async(request)
+    #rclpy.spin_until_future_complete(self, depth_future)
+    self.arm_specification = self.declare_parameter('/mimi_specification')
+  
+  # get 'angle_list[]' degrees. shoulder, albow, wrist 
+  def inverseKinematics(self, coordinate):
+    x  = coordinate[0] # forward / back
+    y  = coordinate[1] # up / down
+    l0 = self.arm_specification['Ground_Arm_Height']
+    l1 = self.arm_specification['Shoulder_Elbow_Length']
+    l2 = self.arm_specification['Elbow_Wrist_Length']
+    l3 = self.arm_specification['Wrist_Endeffector_Length']
+    x -= l3
+    y -= l0
+    data1 = x*x + y*y + l1*l1 - l2*l2
+    data2 = 2 * l1 * math.sqrt(x*x + y*y)
+    try:                             #- or +
+      shoulder_angle = math.atan(y/x) - math.acos(data1 / data2 + math.atan(y/x))
+                  # arctan( (elbowY) /(elbowX) ) - shoulderAngle = (shoulderAngle + elbowAngle) - (shoulderAngle)   
+      elbow_angle = math.atan( (y- l1*math.sin(shoulder_angle)) / (x- l1*math.cos(shoulder_angle)))-shoulder_angle
+      #elbow_angle = math.pi - acos( (l1*l1+l2*l2 - x*x+y*y) / 2*L1*l2 )
+      wrist_angle = -1 * (shoulder_angle + elbow_angle) # !!!
+      angle_list = map(math.degrees, angle_list)
+      return angle_list
+    except ValueError:
+      self.get_logger().info("can't move arm.")
+      return [numpy.nan]*3 # return Not Number list[]
+
+  # we don't use this.
+  # def armController(self, joint_angle):
+  #   try:
+  #     joint_angle = joint_angle.data
+  #   except AttributeError:
+  #     pass
+  #   thread_shoulder = threading.Thread(target=self.controlShoulder, args=(joint_angle[0],))
+  #   thread_elbow = threading.Thread(target=self.controlElbow, args=(joint_angle[1],))
+  #   thread_wrist = threading.Thread(target=self.controlWrist, args=(joint_angle[2],))
+  #   rate = self.create_rate(2)
+  #   thread_wrist.start()
+  #   rate.sleep()
+  #   thread_elbow.start()
+  #   rate.sleep()
+  #   thread_shoulder.start()
+  
+  def armControllerByTopic(self, joint_angle):
+    m0, m1 = self.shoulderConversionProcess(joint_angle[0]) # get radian angle
+    m2 = self.elbowConversionProcess(joint_angle[1])
+    m3 = self.wristConversionProcess(joint_angle[2])
+    print('m0, m1, m2, m3')
+    print(m0, m1, m2, m3)
+    print(map(math.degrees, [m0, m1, m2, m3]))
+    self.motorPub(['m0_shoulder_left_joint', 'm1_shoulder_right_joint', 'm2_elbow_joint', 'm3_wrist_joint'], [m0, m1, m2, m3])  # ƒA[ƒ€‚ð“®‚©‚·
+    #!!!
+  # callback. ArmControl, '/servo/debug_arm':  float64[] data; bool result
+  def armControlService(self, coordinate):
+    try:
+      coordinate = coordinate.data
+    except AttributeError:
+      pass
+    joint_angle = self.inverseKinematics(coordinate)
+    print('')
+    print('joint_angle')
+    print(joint_angle)
+    if numpy.nan in joint_angle:
+      return False
+    #self.armController(joint_angle)
+    self.armControllerByTopic(joint_angle)
+    return True
+  
+  # callback. StrTrg, '/servo/arm': string data: bool result
+  def changeArmPose(self, cmd):
+    if type(cmd) != str:
+      cmd = cmd.data
+    self.get_logger().info("Change arm command : %s"%cmd)
+    if cmd == 'origin':
+      self.originMode()
+      return True
+    elif cmd == 'carry':
+      self.carryMode()
+      return True
+    elif cmd == 'receive':
+      res = self.receiveMode()
+      return res
+    elif cmd == 'give':
+      self.giveMode()
+      return True
+    elif cmd == 'place':
+      res = self.placeMode()
+      return res
+    else :
+      self.get_logger_info('No such change arm command.')
+      return False
+  
+  def originMode(self):
+    shoulder_param = 0
+    elbow_param = 0
+    wrist_param = 0
+    #self.armController([shoulder_param, elbow_param, wrist_param])
+    self.armControllerByTopic([shoulder_param, elbow_param, wrist_param])
     
-
-
+  def carryMode(self):
+    
+    
 def main(args=None):
   rclpy.init(args=args)  # initialize node
   node = Node("motor_controller2")

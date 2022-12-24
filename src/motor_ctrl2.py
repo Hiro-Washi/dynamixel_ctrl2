@@ -102,7 +102,8 @@ class MotorController(Node):
     if type(position_value) == type(float()):
       rotate_value = self.degToStep(position_value) # !!!
     #res = self.m_client('', m_id, 'Goal_Position', position_value)
-    dxl_future = self.dxlCallAsync('', m_id, 'Goal_Position', position_value) #The future object to wait on
+    # The future object to wait on
+    dxl_future = self.dxlCallAsync('', m_id, 'Goal_Position', position_value)
     rclpy.spin_until_future_complete(self, dxl_future)
     result = dxl_future.result()
     #return result # type: Bool
@@ -179,23 +180,23 @@ class JointController(MotorController):
     except AttributeError: # !!!
       pass
     
-    # OPEN
-    rate = self.create_rate[5]
-    if not req: # if eef is close
+    # OPEN eef
+    rate = self.create_rate(5)
+    if not req: # if false -> OPEN eef
       self.setCurrent(4, 200) # set allowable curr
       self.setPosition(4, self.origin_angle[4])
       rate.sleep()
       return True
 
-    # CLOSE
-    c_rate = self.create_rate[2]
-    goal_position = self.origin_angle[4] + 480
-    self.setCurrent(4. 200)
+    # CLOSE 
+    c_rate = self.create_rate(2)
+    goal_position = self.origin_angle[4] + 480 #!!! how did caliculate this
+    self.setCurrent(4, 200) #!!! how did caliculate this
     self.setPosition(4, goal_position)
     c_rate.sleep()
-    # in case of eef anglar velo ia more than 0 and 
+    # in case of eef anglar velo is more than 0 and ~
     while self.rotation_velocity[4] > 0 and not rclpy.shutdown():
-      pass # notiong to do
+      pass #!!! notiong to do
     else:
       c_rate.sleep()
       #self.setPosition(4, self.latest_pose[4])
@@ -222,12 +223,8 @@ class ManipulateArm(JointController):
     # Service to comfirm mani ctrl using IK
     self.create_service( ArmControl, '/servo/debug_arm', self.armControlService) #InverseKinetics
     # SrvClient to get 3D coord
-    self.detect_depth = self.create_client(PositionEstimator, '/detect/depth')
-    while not self.detect_depth.wait_for_service(timeout_sec= 1.0):
-      self.get_logger().info('wait for the service... /detect/depth')
-    self.depth_req = PositionEstimator.Request()
-    #depth_future = self.detect_depth.call_async(request)
-    #rclpy.spin_until_future_complete(self, depth_future)
+    self.depth_client = self.create_client(PositionEstimator, '/detect/depth')
+    # Param
     self.arm_specification = self.declare_parameter('/mimi_specification')
   
   # get 'angle_list[]' degrees. shoulder, albow, wrist 
@@ -245,8 +242,9 @@ class ManipulateArm(JointController):
     try:                             #- or +
       shoulder_angle = math.atan(y/x) - math.acos(data1 / data2 + math.atan(y/x))
                   # arctan( (elbowY) /(elbowX) ) - shoulderAngle = (shoulderAngle + elbowAngle) - (shoulderAngle)   
-      elbow_angle = math.atan( (y- l1*math.sin(shoulder_angle)) / (x- l1*math.cos(shoulder_angle)))-shoulder_angle
-      #elbow_angle = math.pi - acos( (l1*l1+l2*l2 - x*x+y*y) / 2*L1*l2 )
+      elbow_angle = math.atan( (y- l1*math.sin(shoulder_angle)) / (x- l1*math.cos(shoulder_angle)))\
+                    -shoulder_angle
+      #elbow_angle = math.pi - acos( (l1*l1+l2*l2 - x*x+y*y) / 2*L1*l2 ) #!!!
       wrist_angle = -1 * (shoulder_angle + elbow_angle) # !!!
       angle_list = map(math.degrees, angle_list)
       return angle_list
@@ -277,8 +275,9 @@ class ManipulateArm(JointController):
     print('m0, m1, m2, m3')
     print(m0, m1, m2, m3)
     print(map(math.degrees, [m0, m1, m2, m3]))
-    self.motorPub(['m0_shoulder_left_joint', 'm1_shoulder_right_joint', 'm2_elbow_joint', 'm3_wrist_joint'], [m0, m1, m2, m3])  # アームを動かす
-    #!!!
+    # mani mani
+    self.motorPub(['m0_shoulder_left_joint', 'm1_shoulder_right_joint',\
+                   'm2_elbow_joint', 'm3_wrist_joint'], [m0, m1, m2, m3]) #!!!
   # callback. ArmControl, '/servo/debug_arm':  float64[] data; bool result
   def armControlService(self, coordinate):
     try:
@@ -295,7 +294,7 @@ class ManipulateArm(JointController):
     self.armControllerByTopic(joint_angle)
     return True
   
-  # callback. StrTrg, '/servo/arm': string data: bool result
+  # Bool type callback. StrTrg, '/servo/arm': string data: bool result
   def changeArmPose(self, cmd):
     if type(cmd) != str:
       cmd = cmd.data
@@ -327,14 +326,105 @@ class ManipulateArm(JointController):
     self.armControllerByTopic([shoulder_param, elbow_param, wrist_param])
     
   def carryMode(self):
+    shoulder_param = -85
+    elbow_param = 90
+    wrist_param = 90
+    #self.armController([shoulder_param, elbow_param, wrist_param])
+    self.armControllerByTopic([shoulder_param, elbow_param, wrist_param])
     
+  # Bool
+  def receiveMode(self):
+    self.controlHead(25)
+    rate_2 = self.create_rate(2); rate_2.sleep()
+    rate_05 = self.create_rate(0.5)
+    shoulder_param = -40 # !!! I would caliculate
+    elbow_param = 70
+    wrist_param = -30
+    #self.armController([shoulder_param, elbow_param, wrist_param])
+    self.armControllerByTopic([shoulder_param, elbow_param, wrist_param])
+    rate_2.sleep()
+    self.controlEndeffector(False) # OPEN eef
+
+    # wait for 3D coord detection service
+    while not self.detect_depth.wait_for_service(timeout_sec= 1.0):
+      self.get_logger().info('wait for the service... /detect/depth')
+    self.depth_req = PositionEstimator.Request()
+    #depth_future = self.detect_depth.call_async(request)
+    #rclpy.spin_until_future_complete(self, depth_future)
+    endeffector_res = False
+    count = 0
+    '''
+    while not endeffector_res and count<2 and not rclpy.shutdown():
+      self.controlEndeffector(False) # OPEN eef
+      rate_05.sleep()
+      count += 1
+      start_time = time.time()
+      straight_line_distance = 9.99
+      while time.time()-start_time<3.0 and straight_line_distance>0.42 and not rclpy.shutdown():
+        #depth_res = self.detect_depth(280, 360) # !!!
+            #srv/PositionEstimator: int64 center_x; int64 center_y
+            #                       geometry_msgs/Point point
+        self.depth_req.center_x = 280
+        self.depth_req.center_y = 360
+        depth_future = self.depth_client.call_async(self.depth_req)
+        rclpy.spin_until_future_complete(self, depth_future)
+        depth_result = depth_future.result()
+        straight_line_distance = depth_res.point.x #!!!
+      rate_2.sleep()
+      endeffector_res = self.controlEndeffector(True) # CLOSE eef
+      rate_05.sleep()
+    '''
+    self.controlEndeffector(False) # OPEN eef
+    rate_05.sleep()
+    start_time = time.time()
+    straight_line_distance = 9.99
+    #!!!
+    while time.time()-start_time<3.0 and straight_line_distance>0.42 and not rclpy.shutdown():
+      self.depth_req.center_x = 280; self.depth_req.center_y = 365 #!!! obje center?
+      depth_future = self.depth_client.call_async(self.depth_req)
+      rclpy.spin_until_future_complete(self, depth_future)
+      depth_result = depth_future.result()
+      straight_line_distance = depth_result.point.x
+    rate_2.sleep()
+    endeffector_result = self.controlEndeffector(True) # GRASP result
+    rate_05.speep()
+      
+    self.carryMode() # lift a obje and head
+    self.controlHead(0)
+    return endeffector_res
+  
+  #!!! sont need result?
+  def giveMode(self):
+    shoulder_param = -35 #!!! I would caliculate
+    elbow_param = 75
+    wrist_param = -35
+    #self.armController([shoulder_param, elbow_param, wrist_param])
+    self.armControllerByTopic([shoulder_param, elbow_param, wrist_param])
+    rate = self.create_rate(0.25); rate.speep()
+    self.get_logger().info("give!!")
+    '''
+      while self.rotation_velocity[3] > 0 and not rospy.is_shutdown():
+        pass
+      rate_1 = self.create_rate(1.0); rate_1.sleep()
+    '''
+    wrist_error = abs(self.torque_error[3])
+    give_time = time.time()
+    while abs(wrist_error - abs(self.torque_error[3])) < 10 and time.time()-give_time<5.0 and not rclpy.shutdown():
+      pass
+    self.setPosition(4, self.origin_angle[4]) # OPEN
+    rate = self.create_rate(2); rate.sleep()
+    self.carryMode()
+  
+  def placeMode(self):
+    #現時点では家具の高さを予めプログラムに打ち込む必要があり、
+    #その情報をobject_grasperに格納しているのでそちらでplaceの関数をオーバーライドしています。
+    pass
     
 def main(args=None):
-  rclpy.init(args=args)  # initialize node
-  node = Node("motor_controller2")
-
-  mami = ManipulateArm()
-  rclpy.spin(node)
+  rclpy.init(args=args)
+  #node = Node("motor_controller2")
+  mani_arm = ManipulateArm()
+  rclpy.spin(mani_arm)
   
 if __name__ == '__main__':
   main()

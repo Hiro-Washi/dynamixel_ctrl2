@@ -1,4 +1,4 @@
-#!/usr/vin/env python3
+#!/usr/bin/env python3
 #-*- coding: utf-8 -*-
 
 import numpy
@@ -7,6 +7,7 @@ import threading
 import time
 import rclpy
 from rclpy.node import Node
+from rclpy.clock import Clock
 from std_msgs.msg import Bool, Float64, Float64MultiArray
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from dynamixel_workbench_msgs.msg import DynamixelStateList
@@ -42,8 +43,12 @@ class MotorController(Node):
     #dxl_cmd_future = self.m_client.call_async(request)
     #rclpy.spin_until_future_complete(self, dxl_cmd_future)
     # M parameters
-    self.origin_angle = self.declare_parameter('/mimi_specification/Origin_Angle')
-    self.gear_ratio = self.declare_parameter('/mimi_specification/Gear_Ratio')
+    self.declare_parameter('/mimi_specification/Origin_Angle', [0]*6)
+    self.declare_parameter('/mimi_specification/Gear_Ratio', [0.0]*6)
+    self.origin_angle = self.get_parameter('/mimi_specification/Origin_Angle').\
+      get_parameter_value().integer_array_value
+    self.gear_ratio = self.get_parameter('/mimi_specification/Gear_Ratio').\
+      get_parameter_value().double_array_value
     self.latest_pose = [0]*6 # M step values
     self.torque_error = [0]*6 # M current values
     self.rotation_velocity = [0]*6 # M angle values
@@ -81,14 +86,14 @@ class MotorController(Node):
     # JointTrajectory.msg Header header; string[] joint_names; JointTrajectoryPoint[] points
     # JointTrajectoryPoint.msg
     # float64[] positions, velocities, accelerations, effort; duration time_from_start
-    t = self.set_clock().now
-    msg.header.stamp = t.to_msg() #!!!
+    #t = self.set_clock().now
+    msg.header.stamp = Clock.now #t.to_msg() #!!!
     msg.Joint_names = joint_name # <- string[]
     #msg.points = [JointTrajectoryPoint() for i in range(1)]
     msg.points = [JointTrajectoryPoint()]
     msg.points[0].positions = joint_angle  # target angle = float64[ posi[rad] ] <---
     msg.points[0].time_from_start = time.time(execute_time)  # !!!
-    self.motor_pub.publish(msg) 
+    self.m_pub.publish(msg) 
   
   def dxlCallAsync(self, cmd, id, name, value):# !!! want this to be able to do until future_comp
     self.dxl_req.command = cmd
@@ -221,11 +226,13 @@ class ManipulateArm(JointController):
     super(ManipulateArm, self).__init__()
     self.create_service(StrTrg, '/servo/arm', self.changeArmPose)
     # Service to comfirm mani ctrl using IK
-    self.create_service( ArmControl, '/servo/debug_arm', self.armControlService) #InverseKinetics
+    self.create_service( ArmControl, '/servo/debug_arm', self.armControlService) #IK
     # SrvClient to get 3D coord
     self.depth_client = self.create_client(PositionEstimator, '/detect/depth')
     # Param
-    self.arm_specification = self.declare_parameter('/mimi_specification')
+    self.declare_parameter('/mimi_specification', [''])
+    self.arm_specification = self.get_parameter('/mimi_specification').\
+      get_parameter_value().string_array_value
   
   # get 'angle_list[]' degrees. shoulder, albow, wrist 
   def inverseKinematics(self, coordinate):
@@ -387,7 +394,7 @@ class ManipulateArm(JointController):
       straight_line_distance = depth_result.point.x
     rate_2.sleep()
     endeffector_result = self.controlEndeffector(True) # GRASP result
-    rate_05.speep()
+    rate_05.sleep()
       
     self.carryMode() # lift a obje and head
     self.controlHead(0)
